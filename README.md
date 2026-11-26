@@ -92,7 +92,14 @@ Useful knobs in `calibration.json`:
 - `view.feather_px`: seam blending width.
 - per camera `gain`: [r, g, b] to equalise colour between phones.
 
-## 5. Check your Python setup
+## 5. Record stitched videos
+On the hub, switch **View** to Top-down or 3D orbit and press **● Rec**.
+- Recording stops by itself after **10 s**, or press **■ Stop**. You can orbit and zoom while recording.
+- Only the stitched picture is recorded, not the stats or buttons. The video has the screen's shape, up to 1920 px wide, at 30 fps.
+- Videos are saved as `Movies/CamStitch/CamStitch_YYYYMMDD_HHMMSS.mp4`, so they also appear in the phone's Gallery.
+- **Videos (N)** opens the list. Each video has **Play** (in-app), **Export** (Android share sheet: Drive, WhatsApp, Gmail, Files, Nearby Share…) and **Delete** (asks first).
+
+## 6. Check your Python setup
 ```
 python tools/synthetic_test.py
 ```

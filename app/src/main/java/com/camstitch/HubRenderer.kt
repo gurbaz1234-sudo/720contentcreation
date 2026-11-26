@@ -3,6 +3,9 @@ package com.camstitch
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.SurfaceTexture
+import android.opengl.EGL14
+import android.opengl.EGLExt
+import android.opengl.EGLSurface
 import android.opengl.GLES11Ext
 import android.opengl.GLES20
 import android.opengl.GLSurfaceView
@@ -127,6 +130,7 @@ class HubRenderer(private val ctx: Context, private val onGlReady: () -> Unit) :
 
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
         generation++
+        recorder = null; recSurface = EGL14.EGL_NO_SURFACE   // old EGL objects died with the old context
         for (s in sources) try { s.surface.release(); s.st.release() } catch (_: Exception) {}
         sources.clear()
         stitchKey = ""; stitchProg = 0; bowlFor = null
@@ -160,8 +164,69 @@ class HubRenderer(private val ctx: Context, private val onGlReady: () -> Unit) :
         GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)
         when (mode) {
             Mode.GRID -> drawGrid()
-            Mode.TOP, Mode.ORBIT -> drawStitch()
+            Mode.TOP, Mode.ORBIT -> drawStitch(viewW, viewH)
         }
+        if (mode != Mode.GRID) recordFrame()
+    }
+
+    // ------------------------------------------------------------ recording
+
+    private var recorder: VideoRecorder? = null
+    private var recSurface: EGLSurface = EGL14.EGL_NO_SURFACE
+
+    /** Screen size, used to give the video the same aspect as what the user sees. */
+    val screenSize: Pair<Int, Int> get() = viewW to viewH
+
+    /** Starts feeding frames to [r]. Callback on the main thread: true if the GL side is ready. */
+    fun attachRecorder(r: VideoRecorder, done: (Boolean) -> Unit) {
+        view.queueEvent {
+            val ok = try {
+                val dpy = EGL14.eglGetCurrentDisplay()
+                val ctx = EGL14.eglGetCurrentContext()
+                val id = IntArray(1)
+                EGL14.eglQueryContext(dpy, ctx, EGL14.EGL_CONFIG_ID, id, 0)
+                val cfgs = arrayOfNulls<android.opengl.EGLConfig>(1); val n = IntArray(1)
+                EGL14.eglChooseConfig(dpy, intArrayOf(EGL14.EGL_CONFIG_ID, id[0], EGL14.EGL_NONE), 0, cfgs, 0, 1, n, 0)
+                val surf = EGL14.eglCreateWindowSurface(dpy, cfgs[0], r.inputSurface, intArrayOf(EGL14.EGL_NONE), 0)
+                if (surf == null || surf == EGL14.EGL_NO_SURFACE) false else { recSurface = surf; recorder = r; true }
+            } catch (e: Exception) { false }
+            main.post { done(ok) }
+        }
+    }
+
+    /** Stops feeding frames. Callback on the main thread once the GL thread has let go of the recorder. */
+    fun detachRecorder(done: () -> Unit) {
+        view.queueEvent {
+            releaseRecSurface()
+            main.post { done() }
+        }
+    }
+
+    private fun releaseRecSurface() {
+        recorder = null
+        if (recSurface != EGL14.EGL_NO_SURFACE) {
+            try { EGL14.eglDestroySurface(EGL14.eglGetCurrentDisplay(), recSurface) } catch (_: Exception) {}
+            recSurface = EGL14.EGL_NO_SURFACE
+        }
+    }
+
+    private fun recordFrame() {
+        val r = recorder ?: return
+        val pts = r.nextFramePtsNs(System.nanoTime())
+        if (pts < 0) return
+        val dpy = EGL14.eglGetCurrentDisplay()
+        val ctx = EGL14.eglGetCurrentContext()
+        val draw = EGL14.eglGetCurrentSurface(EGL14.EGL_DRAW)
+        val read = EGL14.eglGetCurrentSurface(EGL14.EGL_READ)
+        if (!EGL14.eglMakeCurrent(dpy, recSurface, recSurface, ctx)) return
+        GLES20.glViewport(0, 0, r.width, r.height)
+        GLES20.glClearColor(0.05f, 0.05f, 0.06f, 1f)
+        GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)
+        drawStitch(r.width, r.height)
+        EGLExt.eglPresentationTimeANDROID(dpy, recSurface, pts)
+        EGL14.eglSwapBuffers(dpy, recSurface)
+        EGL14.eglMakeCurrent(dpy, draw, read, ctx)
+        GLES20.glViewport(0, 0, viewW, viewH)
     }
 
     // ------------------------------------------------------------ feed grid
@@ -261,12 +326,12 @@ class HubRenderer(private val ctx: Context, private val onGlReady: () -> Unit) :
         }
     }
 
-    private fun drawStitch() {
+    private fun drawStitch(w: Int, h: Int) {
         val cal = calibration ?: return
         ensureBowl(cal)
         if (!ensureStitchProgram(cal)) return
 
-        val aspect = viewW.toFloat() / viewH
+        val aspect = w.toFloat() / h
         if (mode == Mode.TOP) {
             val half = cal.floorRadius * 1.15f / zoom
             Matrix.orthoM(proj, 0, -half * aspect, half * aspect, -half, half, 0.1f, 100f)

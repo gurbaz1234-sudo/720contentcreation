@@ -40,6 +40,21 @@ class HubActivity : Activity() {
 
     private val calibFile get() = File(getExternalFilesDir(null), "calibration.json")
 
+    // recording + videos
+    private lateinit var recButton: Button
+    private lateinit var videosButton: Button
+    private val lockedDuringRec = ArrayList<Button>()
+    private lateinit var recProgress: android.view.View
+    private lateinit var recLabel: TextView
+    private lateinit var snack: LinearLayout
+    private lateinit var snackText: TextView
+    private lateinit var snackAction: Button
+    private lateinit var videos: VideosPanel
+    private var recorder: VideoRecorder? = null
+    private var recStartMs = 0L
+    private var recStopping = false
+    private fun dp(v: Float) = android.util.TypedValue.applyDimension(android.util.TypedValue.COMPLEX_UNIT_DIP, v, resources.displayMetrics).toInt()
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         cfg = Settings.fromIntent(intent)
@@ -48,7 +63,7 @@ class HubActivity : Activity() {
         renderer.onSnapshotSaved = { msg -> toast(msg) }
         glView = GLSurfaceView(this).apply {
             setEGLContextClientVersion(2)
-            setEGLConfigChooser(8, 8, 8, 8, 16, 0)
+            setEGLConfigChooser(RecordableConfigChooser())
             setRenderer(renderer)
             renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
         }
@@ -64,12 +79,43 @@ class HubActivity : Activity() {
         val bar = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL; setBackgroundColor(0x55000000) }
         fun btn(t: String, f: () -> Unit) = Button(this).apply { text = t; textSize = 11f; setOnClickListener { f() } }.also { bar.addView(it) }
         modeButton = btn("View: ${renderer.mode.label}") { cycleMode() }
-        btn("Snap: lens calib") { renderer.requestSnapshot("intrinsics") }
-        btn("Snap: floor calib") { renderer.requestSnapshot("floor") }
-        btn("Load calibration") { pickCalibration() }
+        recButton = btn("● Rec") { if (recorder != null) stopRecording() else startRecording() }
+        recButton.setTextColor(0xFFB3261E.toInt())
+        lockedDuringRec += btn("Snap: lens calib") { renderer.requestSnapshot("intrinsics") }
+        lockedDuringRec += btn("Snap: floor calib") { renderer.requestSnapshot("floor") }
+        lockedDuringRec += btn("Load calibration") { pickCalibration() }
         btn("Lock/unlock hub cam") { localSender?.let { it.setLocked(!it.isLocked) } }
+        videosButton = btn("Videos (0)") { videos.show() }
+        lockedDuringRec += modeButton; lockedDuringRec += videosButton
         root.addView(bar, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL))
+
+        // recording indicator: red line across the top + "● REC 0:03 / 0:10"
+        recProgress = android.view.View(this).apply { setBackgroundColor(0xFFFF2D2D.toInt()); visibility = android.view.View.GONE }
+        root.addView(recProgress, FrameLayout.LayoutParams(0, dp(3f), Gravity.TOP or Gravity.START))
+        recLabel = TextView(this).apply {
+            setTextColor(Color.WHITE); textSize = 13f; setPadding(dp(10f), dp(5f), dp(10f), dp(5f)); visibility = android.view.View.GONE
+            background = android.graphics.drawable.GradientDrawable().apply { setColor(0x8C000000.toInt()); cornerRadius = dp(14f).toFloat() }
+        }
+        root.addView(recLabel, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.END).apply { setMargins(0, dp(8f), dp(10f), 0) })
+
+        // snackbar: message + optional action
+        snack = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL; visibility = android.view.View.GONE
+            setPadding(dp(16f), dp(4f), dp(8f), dp(4f))
+            background = android.graphics.drawable.GradientDrawable().apply { setColor(0xEB282828.toInt()); cornerRadius = dp(20f).toFloat() }
+        }
+        snackText = TextView(this).apply { setTextColor(Color.WHITE); textSize = 13f }
+        snackAction = Button(this).apply {
+            setTextColor(0xFF8AB4F8.toInt()); textSize = 13f; minWidth = 0; minimumWidth = 0
+            background = android.graphics.drawable.GradientDrawable().apply { setColor(Color.TRANSPARENT) }
+        }
+        snack.addView(snackText); snack.addView(snackAction)
+        root.addView(snack, FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply { bottomMargin = dp(64f) })
+
+        videos = VideosPanel(this) { n -> videosButton.text = "Videos ($n)" }
+        root.addView(videos.root, FrameLayout.LayoutParams(-1, -1))
         setContentView(root)
+        videos.refresh()
 
         loadCalibration(quiet = true)
         setupTouch()
@@ -86,6 +132,7 @@ class HubActivity : Activity() {
 
     override fun onPause() {
         resumed = false
+        if (recorder != null) stopRecording(blocking = true)
         stopPipelines()
         renderer.glReady = false
         glView.onPause()
@@ -118,6 +165,95 @@ class HubActivity : Activity() {
     }
 
     // ---------------------------------------------------------------- UI
+
+    // ---------------------------------------------------------------- recording (max 10 s, stitched views only)
+
+    private fun startRecording() {
+        if (renderer.mode == HubRenderer.Mode.GRID) {
+            toast("Switch View to Top-down or 3D orbit to record the stitched video"); return
+        }
+        val (sw, sh) = renderer.screenSize
+        val (w, h) = VideoRecorder.pickSize(sw, sh)
+        val r = try { VideoRecorder(this, w, h, renderer.mode.label) } catch (e: Exception) {
+            toast("Cannot start recording: ${e.message}"); return
+        }
+        recorder = r; recStopping = false
+        setRecUi(true)
+        renderer.attachRecorder(r) { ok ->
+            if (!ok) { toast("Recording not supported on this device's GPU"); stopRecording() }
+        }
+        recStartMs = android.os.SystemClock.elapsedRealtime()
+        addLog("recording started (${renderer.mode.label}, ${w}x$h)")
+        ui.post(recTick)
+    }
+
+    private val recTick = object : Runnable {
+        override fun run() {
+            if (recorder == null || recStopping) return
+            val el = android.os.SystemClock.elapsedRealtime() - recStartMs
+            val sec = (el / 1000).coerceAtMost(VideoRecorder.MAX_MS / 1000)
+            recLabel.text = "● REC 0:%02d / 0:%02d".format(sec, VideoRecorder.MAX_MS / 1000)
+            val lp = recProgress.layoutParams
+            lp.width = (recProgress.rootView.width * (el.toFloat() / VideoRecorder.MAX_MS).coerceAtMost(1f)).toInt()
+            recProgress.layoutParams = lp
+            if (el >= VideoRecorder.MAX_MS) stopRecording() else ui.postDelayed(this, 100)
+        }
+    }
+
+    private fun stopRecording(blocking: Boolean = false) {
+        val r = recorder ?: return
+        if (recStopping) return
+        recStopping = true
+        ui.removeCallbacks(recTick)
+        setRecUi(false)
+        val finish = {
+            Thread {
+                val ok = try { r.finish() } catch (e: Exception) { false }
+                ui.post {
+                    recorder = null; recStopping = false
+                    if (ok) {
+                        addLog("video saved: ${VideoRecorder.FOLDER}/${r.name}")
+                        showSnack("Saved ${r.name} (%.1f s)".format(r.durationMs / 1000.0), "View") { videos.show() }
+                    } else toast("Recording failed: no frames")
+                    videos.refresh()
+                }
+            }.start()
+        }
+        if (blocking) {
+            // Activity is pausing: the GL thread must let go of the recorder before it stops.
+            val latch = java.util.concurrent.CountDownLatch(1)
+            renderer.detachRecorder { }
+            glView.queueEvent { latch.countDown() }
+            latch.await(500, java.util.concurrent.TimeUnit.MILLISECONDS)
+            finish()
+        } else {
+            renderer.detachRecorder { finish() }
+        }
+    }
+
+    private fun setRecUi(on: Boolean) {
+        recButton.text = if (on) "■ Stop" else "● Rec"
+        lockedDuringRec.forEach { it.isEnabled = !on; it.alpha = if (on) 0.4f else 1f }
+        recLabel.visibility = if (on) android.view.View.VISIBLE else android.view.View.GONE
+        recProgress.visibility = if (on) android.view.View.VISIBLE else android.view.View.GONE
+        if (on) recLabel.text = "● REC 0:00 / 0:%02d".format(VideoRecorder.MAX_MS / 1000)
+    }
+
+    private val hideSnack = Runnable { snack.visibility = android.view.View.GONE }
+
+    private fun showSnack(msg: String, action: String?, onAction: () -> Unit = {}) {
+        snackText.text = msg
+        snackAction.visibility = if (action == null) android.view.View.GONE else android.view.View.VISIBLE
+        snackAction.text = action ?: ""
+        snackAction.setOnClickListener { snack.visibility = android.view.View.GONE; onAction() }
+        snack.visibility = android.view.View.VISIBLE
+        ui.removeCallbacks(hideSnack); ui.postDelayed(hideSnack, 4000)
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onBackPressed() {
+        if (!videos.onBack()) @Suppress("DEPRECATION") super.onBackPressed()
+    }
 
     private fun cycleMode() {
         val next = HubRenderer.Mode.values()[(renderer.mode.ordinal + 1) % HubRenderer.Mode.values().size]
@@ -162,6 +298,7 @@ class HubActivity : Activity() {
     @Deprecated("Deprecated in Java")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
+        if (videos.onActivityResult(requestCode, resultCode)) return
         val uri = data?.data ?: return
         if (requestCode != 42 || resultCode != RESULT_OK) return
         try {
@@ -236,4 +373,24 @@ class HubActivity : Activity() {
             .filter { it.isUp && !it.isLoopback }
             .flatMap { ni -> ni.inetAddresses.toList().filterIsInstance<Inet4Address>().map { "${ni.name}:${it.hostAddress}" } }
     } catch (e: Exception) { emptyList() }
+}
+
+/** Picks an EGL config the video encoder can draw into (EGL_RECORDABLE_ANDROID), with a fallback. */
+class RecordableConfigChooser : GLSurfaceView.EGLConfigChooser {
+    override fun chooseConfig(egl: javax.microedition.khronos.egl.EGL10, display: javax.microedition.khronos.egl.EGLDisplay): javax.microedition.khronos.egl.EGLConfig {
+        val E = javax.microedition.khronos.egl.EGL10.EGL_NONE
+        fun pick(recordable: Boolean): javax.microedition.khronos.egl.EGLConfig? {
+            val a = arrayListOf(
+                javax.microedition.khronos.egl.EGL10.EGL_RED_SIZE, 8, javax.microedition.khronos.egl.EGL10.EGL_GREEN_SIZE, 8,
+                javax.microedition.khronos.egl.EGL10.EGL_BLUE_SIZE, 8, javax.microedition.khronos.egl.EGL10.EGL_ALPHA_SIZE, 8,
+                javax.microedition.khronos.egl.EGL10.EGL_DEPTH_SIZE, 16, javax.microedition.khronos.egl.EGL10.EGL_RENDERABLE_TYPE, 4, // ES2
+            )
+            if (recordable) { a += 0x3142; a += 1 }   // EGL_RECORDABLE_ANDROID
+            a += E
+            val cfgs = arrayOfNulls<javax.microedition.khronos.egl.EGLConfig>(1)
+            val n = IntArray(1)
+            return if (egl.eglChooseConfig(display, a.toIntArray(), cfgs, 1, n) && n[0] > 0) cfgs[0] else null
+        }
+        return pick(true) ?: pick(false) ?: throw IllegalStateException("no suitable EGL config")
+    }
 }
